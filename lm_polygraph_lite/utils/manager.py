@@ -1,0 +1,617 @@
+import traceback
+import logging
+import numpy as np
+import torch
+import sys
+import gc
+import os
+import time
+
+import json
+
+from collections import defaultdict
+from typing import List, Set, Dict, Tuple, Optional
+
+log = logging.getLogger("lm_polygraph_lite")
+from tqdm import tqdm
+
+from lm_polygraph_lite.utils.model import Model
+from lm_polygraph_lite.utils.processor import Processor
+
+from lm_polygraph_lite.generation_metrics.generation_metric import GenerationMetric
+from lm_polygraph_lite.ue_metrics.ue_metric import (
+    UEMetric,
+    get_random_scores,
+    normalize_metric,
+)
+from lm_polygraph_lite.estimators.estimator import Estimator
+from lm_polygraph_lite.stat_calculators.stat_calculator import StatCalculator
+from lm_polygraph_lite.utils.register_stat_calculators import register_stat_calculators
+
+from lm_polygraph_lite.stat_calculators.compiled_features import CompiledFeatures
+from luh.feature_supervision import FeatureSupervision
+
+# Estimator types that provide a feature-extractor config required by CompiledFeatures.
+_COMPILED_FEATURES_ESTIMATOR_TYPES = (FeatureSupervision,)
+
+def _order_calculators(
+    stats: List[str],
+    stat_calculators: Dict[str, StatCalculator],
+    stat_dependencies: Dict[str, List[str]],
+) -> Tuple[List[str], Set[str]]:
+    ordered: List[str] = []
+    have_stats: Set[str] = set()
+    while len(stats) > 0:
+        stat = stats[0]
+        if stat in have_stats:
+            stats = stats[1:]
+            continue
+        dependent = False
+        if stat not in stat_dependencies.keys():
+            raise Exception(
+                f"Cant find stat calculator for: {stat}. Maybe you forgot to register it in "
+                + "lm_polygraph_lite.utils.register_stat_calculators.register_stat_calculators()?"
+            )
+        for d in stat_dependencies[stat]:
+            if d not in have_stats:
+                stats = [d] + stats
+                if stats.count(d) > 40:
+                    raise Exception(f"Found possibly cyclic dependencies: {d}")
+                dependent = True
+        if not dependent:
+            stats = stats[1:]
+            ordered.append(stat)
+            for new_stat in stat_calculators[stat].stats:
+                have_stats.add(new_stat)
+    return ordered, have_stats
+
+
+def _check_unique_names(xs):
+    names = set()
+    for x in xs:
+        if str(x) in names:
+            raise Exception(f"Got multiple __str__ values for {x}")
+        names.add(str(x))
+
+
+def _delete_nans(ue, metric):
+    new_ue, new_metric = [], []
+    for i in range(len(metric)):
+        if not np.isnan(metric[i]) and not np.isnan(ue[i]):
+            if not isinstance(ue[i], complex):
+                new_ue.append(ue[i])
+            else:
+                new_ue.append(ue[i].real)
+            new_metric.append(metric[i])
+
+    return np.array(new_ue), np.array(new_metric)
+
+
+def _flatten_results(results, result_generator_class):
+    """
+    Flattens a list of lists into a single list.
+    Сan be used with any type of result, such as UEs, statistics, or generation metrics.
+
+    Args:
+        results: A list of lists, where each sublist contains results for a single input.
+                 Expected shape: [num_inputs, num_token_level_results_per_input].
+        result_generator_class: The class of the object that generated the results.
+                                 Used for error reporting.
+
+    Returns:
+        A flattened list of results of shape [num_inputs * num_token_level_results_per_input].
+
+    Raises:
+        Exception: If the input is not a list of lists.
+    """
+    if not isinstance(results, list) or not all(isinstance(x, list) for x in results):
+        raise Exception(
+            f"Class {result_generator_class} returned {results}, expected list of lists"
+        )
+    return [result for sample_results in results for result in sample_results]
+
+
+class UEManager:
+    """
+    Manager to conduct uncertainty estimation experiments. Runs a single estimator
+    against one or more generation metrics and reports PredictionRejectionArea scores.
+    """
+
+    def __init__(
+        self,
+        data,
+        model: Model,
+        estimator: Estimator,
+        generation_metrics: List[GenerationMetric],
+        ue_metrics: List[UEMetric],
+        processors: List[Processor],
+        train_data=None,
+        background_train_data=None,
+        ignore_exceptions: bool = True,
+        language: str = "en",
+        verbose: bool = True,
+        max_new_tokens: int = 100,
+        background_train_dataset_max_new_tokens: int = 100,
+        cache_path=os.path.expanduser("~") + "/.cache",
+        output_file: Optional[str] = None,
+
+        md_save_file: Optional[str] = None,
+    ):
+        """
+        Parameters:
+            data: Dataset to run benchmark on. Any object whose iteration yields
+                (input_texts, target_texts) batches and supports
+                len(), e.g. probe_drift.dataset.Dataset or utils.dataset.RawTextDataset.
+            model (Model): Model to run benchmark on.
+            estimator (Estimator): Estimator to evaluate at benchmark.
+            generation_metrics (List[GenerationMetrics]): List of methods to use to calculate ground-truth uncertainty.
+            ue_metrics (List[UEMetric]): List of methods to measure correlation between ground-truth uncertainties from
+                `generation_metrics` and uncertainty estimators in `estimators`.
+            processors (List[Processor]): List of processors to apply after each batch.
+            train_data: Dataset to train density-based estimators on. Can be set to None, if
+                no density-based method is used. Default: None.
+            ignore_exceptions (bool): If true, exceptions on a new batch will be printed to stderr and
+                the batch will be skipped. Useful to skip CUDA OOM errors on large datasets. Default: True.
+            language (str): Language to test in claim-level benchmark, one of 'en', 'zh', 'ar', 'ru'. Default: 'en'.
+            verbose (bool): If set, will print useful info during batch processing. Default: True.
+            max_new_tokens (int): Maximum new tokens to use in generation. Default: 100.
+        """
+
+        stat_calculators_dict, stat_dependencies_dict = register_stat_calculators(
+            language=language,
+            cache_path=cache_path,
+            model=model,
+        )
+
+        self.stat_calculators_dict = stat_calculators_dict
+
+        self.output_file = output_file
+
+        self.md_save_file = md_save_file
+        self._md_train_dists_saved = False
+
+        if self.output_file is not None:
+            assert not os.path.exists(self.output_file), f"output_file already exists: {self.output_file}"
+            os.makedirs(os.path.dirname(os.path.abspath(self.output_file)), exist_ok=True)
+            open(self.output_file, "w").close()
+
+        if self.md_save_file is not None:
+            md_jsonl = self.md_save_file + ".jsonl"
+            assert not os.path.exists(md_jsonl), f"md_save_file already exists: {md_jsonl}"
+            os.makedirs(os.path.dirname(os.path.abspath(md_jsonl)), exist_ok=True)
+            open(md_jsonl, "w").close()
+
+        self.model: Model = model
+        self.train_data = train_data
+        self.background_train_data = background_train_data
+        self.data = data
+        self.estimator: Estimator = estimator
+        self.generation_metrics: List[GenerationMetric] = generation_metrics
+        self.ue_metrics: List[UEMetric] = ue_metrics
+        _check_unique_names(generation_metrics)
+        _check_unique_names(ue_metrics)
+
+        greedy = ["greedy_texts", "greedy_tokens"]
+
+        stats = (
+            list(self.estimator.stats_dependencies)
+            + [s for m in generation_metrics for s in m.stats_dependencies]
+            + greedy
+        )
+
+        stats, have_stats = _order_calculators(
+            stats,
+            stat_calculators_dict,
+            stat_dependencies_dict,
+        )
+
+        stats = [s for s in stats if not str(s).startswith("ensemble_")]
+        self.stat_calculators: List[StatCalculator] = [
+            stat_calculators_dict[c] for c in stats
+        ]
+        if verbose:
+            log.info("Stat calculators: %s", self.stat_calculators)
+
+        train_stats = [
+            s for s in self.estimator.stats_dependencies
+            if s.startswith("train")
+        ]
+
+        train_stats += (
+            ["greedy_tokens", "greedy_texts"]
+            if "train_greedy_log_likelihoods" in train_stats
+            else []
+        )
+
+        train_stats, _ = _order_calculators(
+            train_stats,
+            stat_calculators_dict,
+            stat_dependencies_dict,
+        )
+        
+        self.train_stat_calculators: List[StatCalculator] = [
+            stat_calculators_dict[c] for c in train_stats
+        ]
+
+
+        background_train_stats = [
+            s for s in self.estimator.stats_dependencies
+            if s.startswith("background_train")
+        ]
+        background_train_stats, _ = _order_calculators(
+            background_train_stats,
+            stat_calculators_dict,
+            stat_dependencies_dict,
+        )
+        self.background_train_stat_calculators: List[StatCalculator] = [
+            stat_calculators_dict[c] for c in background_train_stats
+        ]
+
+        self.gen_metrics: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+        self.estimations: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+        self.metrics: Dict[Tuple[str, str, str, str], float] = {}
+        self.total_bad_estimators: Dict[Estimator, float] = {}
+        self.stats: Dict[str, List] = defaultdict(list)
+        self.time_stats: Dict[str, List] = defaultdict(list)
+
+        self.processors = processors
+        self.ignore_exceptions = ignore_exceptions
+        self.verbose = verbose
+        self.max_new_tokens = max_new_tokens
+        self.background_train_dataset_max_new_tokens = (
+            background_train_dataset_max_new_tokens
+        )
+
+    def _get_extracted_features(self):
+        assert isinstance(self.estimator, _COMPILED_FEATURES_ESTIMATOR_TYPES)
+        return self.estimator.cfg.feature_extractor, self.estimator.cfg
+
+    def __call__(self) -> Dict[Tuple[str, str, str, str], float]:
+        """
+        Runs benchmark and reports metrics results. Saves all useful calculated statistics for further usage.
+        The run includes:
+        * Calculating uncertainty estimations for each `estimator` for all input texts in the dataset
+        * Calculating ground-truth uncertainties for each `generation_metrics` for all input texts in the dataset.
+            * Calculating correlation measure for each `ue_metrics`, between each pair of
+              (uncertainty estimation, ground-truth uncertainty) which comes from the same level
+              (both 'sequence' or both 'token').
+            * Saving uncertainty estimations, ground-truth uncertainties and ue_metrics values for further usage.
+
+            Returns:
+                [Tuple[str, str, str, str], float]: dictionary with metrics results. Dictionary keys consist of
+                    - uncertainty estimation level: 'sequence' or 'token',
+                    - estimator name,
+                    - generation metrics name,
+                    - `ue_metrics` name which was used to calculate quality.
+            """
+
+        train_stats = self._extract_train_embeddings()
+        background_train_stats = self._extract_train_embeddings(background=True)
+
+        iterable_data = tqdm(self.data) if self.verbose else self.data
+
+        for batch_i, (inp_texts, target_texts) in enumerate(
+            iterable_data
+        ):
+            batch_stats: Dict[str, np.ndarray] = {}
+            for key, val in [
+                ("input_texts", inp_texts),
+                ("target_texts", target_texts),
+            ]:
+                self.stats[key] += val
+                batch_stats[key] = val
+            batch_stats["model"] = self.model
+
+            train_stats_keys = list(train_stats.keys())
+
+            for stat in train_stats_keys:
+                batch_stats[stat] = train_stats.pop(stat)
+
+            background_train_stats_keys = list(background_train_stats.keys())
+            for stat in background_train_stats_keys:
+                batch_stats[stat] = background_train_stats.pop(stat)
+            
+            batch_stats["tokenizer"] = self.model.tokenizer
+
+            batch_stats = self.calculate(batch_stats, self.stat_calculators, inp_texts, self.max_new_tokens)
+
+            batch_estimations = self.estimate(batch_stats, batch_i)
+
+            batch_gen_metrics: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+            for generation_metric in self.generation_metrics:
+                m = generation_metric(batch_stats, target_texts=target_texts)
+                if not isinstance(m, list):
+                    m = m.tolist()
+                if generation_metric.level == "claim":
+                    m = _flatten_results(m, generation_metric)
+                self.gen_metrics[generation_metric.level, str(generation_metric)] += m
+                batch_gen_metrics[generation_metric.level, str(generation_metric)] += m
+
+            for key in [
+                "greedy_texts",
+                "greedy_tokens",
+                "claim_texts_concatenated",
+                "train_greedy_texts",
+                "train_greedy_tokens",
+                "train_input_texts",
+            ]:
+                if key in batch_stats.keys():
+                    self.stats[key] += batch_stats[key]
+            for key in batch_stats.keys():
+                if key.startswith("train_seq"):
+                    self.stats[key] += batch_stats[key].tolist()
+            for processor in self.processors:
+                processor.on_batch(batch_stats, batch_gen_metrics, batch_estimations)
+        
+
+        for (gen_level, gen_name), generation_metric in self.gen_metrics.items():
+            ue_metric = self.ue_metrics[0]
+
+            assert len(self.ue_metrics) == 1
+
+            oracle_score = ue_metric(
+                -np.array(generation_metric), np.array(generation_metric)
+            )
+            random_score = get_random_scores(ue_metric, np.array(generation_metric))
+
+            for (e_level, e_name), estimator_values in self.estimations.items():
+                if gen_level != e_level:
+                    continue
+                if len(estimator_values) != len(generation_metric):
+                    raise Exception(
+                        f"Got different number of metrics for {e_name} and {gen_name}: "
+                        f"{len(estimator_values)} and {len(generation_metric)}"
+                    )
+
+                ue, metric = _delete_nans(estimator_values, generation_metric)
+                
+                if len(ue) == 0:
+                    self.metrics[e_level, e_name, gen_name, str(ue_metric)] = np.nan
+                else:
+                    if len(ue) != len(estimator_values):
+                        oracle_score_ = ue_metric(-metric, metric)
+                        random_score_ = get_random_scores(ue_metric, metric)
+                    else:
+                        oracle_score_ = oracle_score
+                        random_score_ = random_score
+
+                    ue_metric_val = ue_metric(ue, metric)
+                    self.metrics[e_level, e_name, gen_name, str(ue_metric)] = (
+                        ue_metric_val
+                    )
+
+                    self.metrics[
+                        e_level, e_name, gen_name, str(ue_metric) + "_normalized"
+                    ] = normalize_metric(
+                        ue_metric_val, oracle_score_, random_score_
+                    )
+
+
+        for processor in self.processors:
+            processor.on_eval(self.metrics, self.total_bad_estimators)
+
+        return self.metrics
+
+    def calculate(self, batch_stats: dict, calculators: list, inp_texts: list, max_new_tokens: int = None) -> dict:
+        """
+        Runs stat calculators and handles errors if any occur. Returns updated batch stats
+
+        Parameters:
+            batch_stats (dict): contains current batch statistics to be updated
+            calculators (list): list of stat calculators to run
+            inp_texts (list): list of inputs to the model in the batch
+        """
+
+        for stat_calculator in calculators:
+
+            needed_for_inference = False
+            for x in stat_calculator._stats:
+                if not x.startswith("train_"):
+                    needed_for_inference = True
+
+            if not needed_for_inference:
+                continue
+
+            max_new_tokens_current = self.max_new_tokens if max_new_tokens is None else max_new_tokens
+            try:
+                start = time.time()
+
+                # CompiledFeatures needs feature extractors passed explicitly.
+                if isinstance(stat_calculator, CompiledFeatures):
+
+                    feature_extractors, head_cfg = self._get_extracted_features()
+
+                    new_stats = stat_calculator(
+                        batch_stats, inp_texts, self.model, max_new_tokens_current, feature_extractors=feature_extractors, head_cfg=head_cfg)
+                else:
+                    new_stats = stat_calculator(
+                        batch_stats, inp_texts, self.model, max_new_tokens_current)
+                end = time.time()
+
+                for stat, stat_value in new_stats.items():
+
+                    if stat in batch_stats.keys():
+                        continue
+
+                    batch_stats[stat] = stat_value
+                    self.time_stats[stat] += [end - start]
+            except Exception as e:
+                if self.ignore_exceptions:
+                    lineno = e.__traceback__.tb_lineno
+                    log_msg = f"Caught exception while calculating stats: {e} in Stat Calculator {stat_calculator}, line {lineno}. Expect dependent estimator to fail.\n"
+                    sys.stderr.write("\n\n")
+                    sys.stderr.write(log_msg)
+                    sys.stderr.write(traceback.format_exc())
+                    continue
+                else:
+                    raise e
+
+        return batch_stats
+
+    def estimate(
+        self, batch_stats: dict, batch_i: int
+    ) -> Dict[Tuple[str, str], List[float]]:
+        if self.estimator in self.total_bad_estimators:
+            return {}
+
+        try:
+            start = time.time()
+            if isinstance(self.estimator, FeatureSupervision):
+                e = self.estimator(batch_stats, self.max_new_tokens)
+            else:
+                e = self.estimator(batch_stats)
+
+            if self.output_file is not None:
+                e_list = e.tolist() if hasattr(e, 'tolist') else e
+                if not isinstance(e_list, list):
+                    e_list = [e_list]
+                with open(self.output_file, "a") as f:
+                    for inp, score in zip(batch_stats['input_texts'], e_list):
+                        json.dump({"input_text": inp, "score": score}, f)
+                        f.write("\n")
+
+            if self.md_save_file is not None and hasattr(self.estimator, 'last_eval_mds') and self.estimator.last_eval_mds is not None:
+                # Save per-sequence MD distances for this batch: one JSON line per sequence,
+                # each line is a list of mean MD values across layers.
+                batch_size = len(batch_stats['input_texts'])
+                n_layers = len(self.estimator.last_eval_mds)
+                with open(self.md_save_file + ".jsonl", "a") as f:
+                    for seq_i in range(batch_size):
+                        row = [float(self.estimator.last_eval_mds[layer_i][seq_i]) for layer_i in range(n_layers)]
+                        json.dump(row, f)
+                        f.write("\n")
+                if not self._md_train_dists_saved and hasattr(self.estimator, 'train_dists'):
+                    np.save(self.md_save_file + "_train.npy", self.estimator.train_dists)
+                    self._md_train_dists_saved = True
+
+            end = time.time()
+            if not isinstance(e, list):
+                e = e.tolist()
+            if self.estimator.level == "claim":
+                e = _flatten_results(e, self.estimator)
+            key = (self.estimator.level, str(self.estimator))
+            self.estimations[key] += e
+            self.time_stats[str(self.estimator)] += [end - start]
+            return {key: e}
+
+        except Exception as exc:
+            if self.ignore_exceptions:
+                key = (self.estimator.level, str(self.estimator))
+                self.estimations.pop(key, None)
+                self.total_bad_estimators[self.estimator] = batch_i
+                lineno = exc.__traceback__.tb_lineno
+                log_msg = f"Caught exception while estimating uncertainty: {exc} in estimator {self.estimator}, line {lineno}. Estimator will be removed.\n"
+                sys.stderr.write("\n\n")
+                sys.stderr.write(log_msg)
+                sys.stderr.write(traceback.format_exc())
+                return {}
+            else:
+                raise exc
+
+    def _extract_train_embeddings(
+        self, background: bool = False
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+        train_stats = {}
+        result_train_stat = {}
+
+        if background:
+            data = self.background_train_data
+            stat_calculators = self.background_train_stat_calculators
+            max_new_tokens = self.background_train_dataset_max_new_tokens
+        else:
+            data = self.train_data
+            stat_calculators = self.train_stat_calculators
+            max_new_tokens = self.max_new_tokens
+
+        
+        consider_token_outputs_independently = {'input_texts': True, 'target_texts': True}
+        source_ids_offset = 0
+
+        if len(stat_calculators) and (data is not None):
+
+            for inp_texts, target_texts in tqdm(data):
+                batch_stats: Dict[str, np.ndarray] = {}
+                for key, val in [
+                    ("input_texts", inp_texts),
+                    ("target_texts", target_texts),
+                ]:
+                    batch_stats[key] = val
+
+                # source_ids (per-example source dataset id) is only meaningful for the
+                # foreground training data; background_train_data (the C4 corpus used for
+                # SATRMD-family MD statistics) isn't one of the classified datasets.
+                if (not background) and (data.source_ids is not None):
+                    batch_stats["source_ids"] = data.source_ids[
+                        source_ids_offset : source_ids_offset + len(inp_texts)
+                    ]
+                    consider_token_outputs_independently["source_ids"] = True
+                source_ids_offset += len(inp_texts)
+
+                for stat_calculator in stat_calculators:
+                    # CompiledFeatures needs feature extractors passed explicitly.
+                    if isinstance(stat_calculator, CompiledFeatures):
+                        feature_extractors, head_cfg = self._get_extracted_features()
+
+                        new_stats = stat_calculator(
+                        batch_stats, inp_texts, self.model, max_new_tokens, feature_extractors=feature_extractors, head_cfg=head_cfg)
+                    else:
+                        new_stats = stat_calculator(
+                            batch_stats, inp_texts, self.model, max_new_tokens)
+
+                    for stat, stat_value in new_stats.items():
+                        if stat in batch_stats.keys():
+                            continue
+                        if not len(stat_value):
+                            continue
+                        batch_stats[stat] = stat_value
+
+                        if train_stats == {}:
+                            consider_token_outputs_independently[stat] = getattr(stat_calculator, 'consider_token_outputs_independently', True)
+
+                for stat in batch_stats.keys():
+                    if "embeddings_all" in stat:
+                        continue
+                    if "attentions_all" in stat:
+                        continue
+                    if stat in train_stats.keys():
+                        train_stats[stat].append(batch_stats[stat])
+                    else:
+                        train_stats[stat] = [batch_stats[stat]]
+
+                del batch_stats
+                torch.cuda.empty_cache()
+                gc.collect()
+         
+            key_prefix = "background_train_" if background else "train_"
+            keys = list(train_stats.keys())
+
+            for stat in keys:
+                if consider_token_outputs_independently[stat]:
+                    result_train_stat[key_prefix + stat] = [
+                        item for sublist in train_stats[stat] for item in sublist
+                    ]
+                else:
+                    result_train_stat[key_prefix + stat] = train_stats[stat]
+                del train_stats[stat]                  
+        
+        return result_train_stat
+
+    def save(self, save_path: str):
+        """
+        Saves the run results in the provided path. Will raise exception, if no results are calculated yet.
+
+        Parameters:
+            save_path (str): Path to file to save benchmark results to.
+        """
+        if len(self.metrics) == 0:
+            raise Exception("Nothing to save. Consider calling manager() first.")
+        torch.save(
+            {
+                "metrics": self.metrics,
+                "gen_metrics": self.gen_metrics,
+                "estimations": self.estimations,
+                "stats": self.stats,
+                "time_stats": self.time_stats,
+            },
+            save_path,
+        )
