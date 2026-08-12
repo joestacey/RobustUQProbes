@@ -9,7 +9,8 @@ Inputs:
   --md_save_prefix    md_save_file prefix from a --method satmd run.
   --layer_index       Which saved layer to use. Default -1 (last saved).
 
-All three inputs must come from runs using the same --eval_dataset.
+All three inputs must come from runs using the same eval dataset config and
+subsample_eval_dataset value (fixed seed=1 keeps the eval order aligned).
 
 Output: one JSON line per eval example, {"input_text": ..., "score": ...},
 written to --output.

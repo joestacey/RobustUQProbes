@@ -1,0 +1,8 @@
+
+This file explains the differences between this branch (used for all paper experiments) and the main branch (the latest code):
+
+- The main branch is implemented using ProbeDrift, which is a separate python library storing the train / eval splits for each of the ID / OOD settings in the paper. Small differences include how in ProbeDrift the few-shot examples are always fixed.
+- The main branch prevents generations starting with a ('\n') from terminating immediately, which impacted a very small number of examples in this branch (inherited from the original satmd repo)
+- In this branch we follow the satmd paper in training with bidirectional alignscores, while evaluation picks between bidirectional and unidirectional alignscores depending on the evaluation dataset. In the main branch we use the same type of alignscore for both training and evaluation for each dataset, where the leave-one-out training data trains on a mix of bidirectional and unidirectional alignscores (with the type of alignscore used depending on which dataset the training examples come from).
+
+

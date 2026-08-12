@@ -79,7 +79,6 @@ class HUQ_LRTMD(Estimator):
         hidden_layers: List[int] = [0, -1],
         metric=None,
         metric_name: str = "",
-        metric_router=None,
         metric_md=None,
         metric_md_name: str = "",
         aggregated: bool = False,
@@ -127,7 +126,7 @@ class HUQ_LRTMD(Estimator):
         self.remove_alg = remove_alg
         self.md = LinRegTokenMahalanobisDistance(
             embeddings_type,
-            metric=metric, metric_name=metric_name, metric_router=metric_router,
+            metric=metric, metric_name=metric_name,
             metric_md=metric_md, metric_md_name=metric_md_name,
             aggregated=aggregated,
             hidden_layers=hidden_layers, metric_thr=metric_thr,

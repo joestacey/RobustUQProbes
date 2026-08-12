@@ -49,35 +49,25 @@ class AlignScore(GenerationMetric):
 
         greedy_texts = stats["greedy_texts"]
 
-        # Expand multiref examples: each (output, single_reference) pair becomes one row.
-        exp_targets: List[str] = []
-        exp_outputs: List[str] = []
-        example_indices: List[int] = []
-        for i, (tgt, out) in enumerate(zip(target_texts, greedy_texts)):
-            out_filt = out if len(out.strip()) else "(empty)"
-            refs = tgt if isinstance(tgt, list) else [tgt]
-            for r in refs:
-                exp_targets.append(r if len(r.strip()) else "(empty)")
-                exp_outputs.append(out_filt)
-                example_indices.append(i)
-
-        exp_scores = np.array(
-            self.scorer.score(claims=exp_targets, contexts=exp_outputs)
+        filtered_targets = [x if len(x.strip()) else "(empty)" for x in target_texts]
+        filtered_outputs = [x if len(x.strip()) else "(empty)" for x in greedy_texts]
+        
+        scores = np.array(
+            self.scorer.score(
+                claims=filtered_targets,
+                contexts=filtered_outputs,
+            )
         )
         if self.return_mean or self.return_inverse:
-            exp_scores_ = np.array(
-                self.scorer.score(claims=exp_outputs, contexts=exp_targets)
+            scores_ = np.array(
+                self.scorer.score(
+                    claims=filtered_outputs,
+                    contexts=filtered_targets,
+                )
             )
-
-        def _aggregate(values: np.ndarray) -> np.ndarray:
-            agg = np.full(len(target_texts), -np.inf)
-            for idx, v in zip(example_indices, values):
-                if v > agg[idx]:
-                    agg[idx] = v
-            return agg
-
+            
         if self.return_mean:
-            return _aggregate((exp_scores + exp_scores_) / 2)
+            return (scores + scores_) / 2
         if self.return_inverse:
-            return _aggregate(exp_scores_)
-        return _aggregate(exp_scores)
+            return scores_
+        return scores

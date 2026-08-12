@@ -140,7 +140,6 @@ class WhiteboxModel(Model):
             tokenizer: PreTrainedTokenizer,
             initial_decoder_input_length: int,
             batch_size: int,
-            require_prior_content: bool = False,
         ) -> None:
             self.initial_decoder_input_length = initial_decoder_input_length
             self.done_tracker = [False] * batch_size
@@ -152,58 +151,31 @@ class WhiteboxModel(Model):
             # matches that a different tokenization would otherwise miss.
             self.sequence_id_len = len(self.sequence_ids) + 2
             self.tokenizer = tokenizer
-            # If set, a match only ends generation once non-whitespace content
-            # exists before it, so a leading stop-sequence match (e.g. '\n'
-            # before any real answer) doesn't end generation with zero content.
-            self.require_prior_content = require_prior_content
 
         def __call__(self, input_ids, scores, **kwargs) -> bool:
             # For efficiency, we compare the last n tokens where n is the number of tokens in the stop_sequence
-            generated_ids_batch = input_ids[:, self.initial_decoder_input_length :]
+            lookback_ids_batch = input_ids[:, self.initial_decoder_input_length :]
 
-            lookback_ids_batch = generated_ids_batch[:, -self.sequence_id_len :]
+            lookback_ids_batch = lookback_ids_batch[:, -self.sequence_id_len :]
 
             lookback_tokens_batch = self.tokenizer.batch_decode(lookback_ids_batch)
 
-            if self.require_prior_content:
-                full_tokens_batch = self.tokenizer.batch_decode(generated_ids_batch)
-
             for i, done in enumerate(self.done_tracker):
                 if not done:
-                    matched = self.sequence in lookback_tokens_batch[i]
-                    if matched and self.require_prior_content:
-                        # Check content before the matched occurrence, not the
-                        # full text: a stale earlier match (e.g. leading '\n')
-                        # could otherwise satisfy the check on its own.
-                        full_text = full_tokens_batch[i]
-                        last_idx = full_text.rfind(self.sequence)
-                        content_before = (
-                            full_text[:last_idx] if last_idx >= 0 else full_text
-                        )
-                        matched = bool(
-                            content_before.replace(self.sequence, "").strip()
-                        )
-                    self.done_tracker[i] = matched
+                    self.done_tracker[i] = self.sequence in lookback_tokens_batch[i]
             return False not in self.done_tracker
 
     def get_stopping_criteria(self, input_ids: torch.Tensor):
         eos = self.tokenizer.decode(self.tokenizer.eos_token_id)
-        generate_until = list(self.generation_parameters.generate_until)
-        stop_sequences = generate_until + [eos]
-        # Only the user-requested generate_until sequences require prior
-        # content before they're allowed to stop generation; the appended
-        # eos sequence stops immediately as before.
-        require_prior_content_flags = [True] * len(generate_until) + [False]
+        stop_sequences = list(self.generation_parameters.generate_until) + [eos]
         return StoppingCriteriaList(
             [
-                self._MultiTokenEOSCriteria(
-                    sequence,
-                    self.tokenizer,
-                    input_ids.shape[1],
-                    input_ids.shape[0],
-                    require_prior_content=flag,
-                )
-                for sequence, flag in zip(stop_sequences, require_prior_content_flags)
+                *[
+                    self._MultiTokenEOSCriteria(
+                        sequence, self.tokenizer, input_ids.shape[1], input_ids.shape[0]
+                    )
+                    for sequence in stop_sequences
+                ],
             ]
         )
 

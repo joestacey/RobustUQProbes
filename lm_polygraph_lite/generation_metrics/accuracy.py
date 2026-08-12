@@ -71,22 +71,13 @@ class AccuracyMetric(GenerationMetric):
         result = []
 
         for hyp, ref in zip(greedy_texts, target_texts):
+            ref = self._filter_text(ref, self.target_ignore_regex)
             hyp = self._filter_text(hyp, self.output_ignore_regex)
+
             if self.normalize:
+                ref = self._normalize_text(ref)
                 hyp = self._normalize_text(hyp)
 
-            if isinstance(ref, list):
-                per_ref = []
-                for r in ref:
-                    r = self._filter_text(r, self.target_ignore_regex)
-                    if self.normalize:
-                        r = self._normalize_text(r)
-                    per_ref.append(self._score_single(hyp, r))
-                result.append(max(per_ref) if per_ref else 0)
-            else:
-                ref = self._filter_text(ref, self.target_ignore_regex)
-                if self.normalize:
-                    ref = self._normalize_text(ref)
-                result.append(self._score_single(hyp, ref))
+            result.append(self._score_single(hyp, ref))
 
         return np.array(result)

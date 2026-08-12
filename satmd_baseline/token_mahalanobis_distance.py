@@ -22,7 +22,6 @@ class TokenMahalanobisDistance(Estimator):
         hidden_layer: int = -1,
         metric = None,
         metric_name: str = "",
-        metric_router = None,
         aggregated: bool = False,
         device: str = "cuda",
         storage_device: str = "cuda",
@@ -46,7 +45,6 @@ class TokenMahalanobisDistance(Estimator):
         self.device = device
         self.storage_device = storage_device
         self.aggregated = aggregated
-        self.metric_router = metric_router
         if metric is not None:
             self.metric = metric
             if aggregated:
@@ -82,8 +80,7 @@ class TokenMahalanobisDistance(Estimator):
                 if self.metric_thr > 0:
                     train_greedy_tokens = stats[f"train_greedy_tokens"]
                     train_target_texts = stats[f"train_target_texts"]
-                    train_source_ids = stats["train_source_ids"] if self.metric_router is not None else [None] * len(train_greedy_texts)
-
+                    
                     metric_key = f"train_{self.metric_name}_{len(train_greedy_texts)}"
 
                     if metric_key in stats.keys():
@@ -91,8 +88,7 @@ class TokenMahalanobisDistance(Estimator):
                     else:
                         metrics = []
 
-                        for x, y, x_t, src in zip(train_greedy_texts, train_target_texts, train_greedy_tokens, train_source_ids):
-                            metric = self.metric_router(src) if self.metric_router is not None else self.metric
+                        for x, y, x_t in zip(train_greedy_texts, train_target_texts, train_greedy_tokens):
 
                             if isinstance(y, list) and (not self.aggregated):
                                 y_ = y[0]
@@ -101,7 +97,7 @@ class TokenMahalanobisDistance(Estimator):
                             else:
                                 y_ = y
 
-                            metrics.append([metric({"greedy_texts": [x], "target_texts": [y_]}, [y_])[0]] * len(x_t))
+                            metrics.append([self.metric({"greedy_texts": [x], "target_texts": [y_]}, [y_])[0]] * len(x_t))
 
                         self.train_token_metrics = np.concatenate(metrics)
                         stats[metric_key] = self.train_token_metrics

@@ -29,7 +29,6 @@ class LinRegTokenMahalanobisDistance_Hybrid(Estimator):
         hidden_layers: List[int] = [0, -1],
         metric = None,
         metric_name: str = "",
-        metric_router = None,
 
         metric_md = None,
         metric_md_name: str = "",
@@ -47,7 +46,7 @@ class LinRegTokenMahalanobisDistance_Hybrid(Estimator):
 
         device: str = "cuda",
         storage_device: str = "cuda",
-    
+
         sim_pca: bool = False,
         n_components: int = 10,
     ):
@@ -75,17 +74,16 @@ class LinRegTokenMahalanobisDistance_Hybrid(Estimator):
                     dependencies += [f"background_train_token_embeddings_{layer}"]
             if ue == "TokenMahalanobis":
                 self.tmds[layer] = TokenMahalanobisDistance(
-                    embeddings_type, normalize=False, metric_thr=metric_thr, metric=metric_md, metric_name=metric_md_name, metric_router=metric_router, aggregation="none", hidden_layer=layer, aggregated=aggregated, device=self.device, storage_device=self.storage_device,
+                    embeddings_type, normalize=False, metric_thr=metric_thr, metric=metric_md, metric_name=metric_md_name, aggregation="none", hidden_layer=layer, aggregated=aggregated, device=self.device, storage_device=self.storage_device,
                 )
             elif ue == "RelativeTokenMahalanobis":
                 self.tmds[layer] = RelativeTokenMahalanobisDistance(
-                    embeddings_type, normalize=False, metric_thr=metric_thr, metric=metric_md, metric_name=metric_md_name, metric_router=metric_router, aggregation="none", hidden_layer=layer, aggregated=aggregated, device=self.device, storage_device=self.storage_device,
+                    embeddings_type, normalize=False, metric_thr=metric_thr, metric=metric_md, metric_name=metric_md_name, aggregation="none", hidden_layer=layer, aggregated=aggregated, device=self.device, storage_device=self.storage_device,
                 )
         super().__init__(dependencies, "sequence")
         self.is_fitted = False
         self.metric_thr = metric_thr
         self.aggregated=aggregated
-        self.metric_router = metric_router
         if metric is not None:
             self.metric = metric
             if aggregated:
@@ -108,35 +106,32 @@ class LinRegTokenMahalanobisDistance_Hybrid(Estimator):
         return f"Hybrid{self.meta_model}{self.ue}Distance_{self.embeddings_type}{hidden_layers} ({self.aggregation}, {self.metric_name}, {self.metric_md_name}, {self.metric_thr}, {positive}, {remove_corr}{self.sim_pca_name})"
 
     def __call__(self, stats: Dict[str, np.ndarray]) -> np.ndarray:
-        
-        if not self.is_fitted: 
+
+        if not self.is_fitted:
             train_greedy_texts = stats[f"train_greedy_texts"]
             train_greedy_tokens = stats[f"train_greedy_tokens"]
             train_target_texts = stats[f"train_target_texts"]
             train_greedy_log_probs = stats[f"train_greedy_log_probs"]
             train_greedy_log_likelihoods = stats[f"train_greedy_log_likelihoods"]
 
-            train_source_ids = stats["train_source_ids"] if self.metric_router is not None else [None] * len(train_greedy_texts)
             metric_key = f"train_seq_{self.metric_name}_{len(train_greedy_texts)}"
             if metric_key in stats.keys():
                 self.train_seq_metrics = stats[metric_key]
             else:
                 metrics = []
-                for x, y, x_t, src in zip(train_greedy_texts, train_target_texts, train_greedy_tokens, train_source_ids):
-                    metric = self.metric_router(src) if self.metric_router is not None else self.metric
-
+                for x, y, x_t in zip(train_greedy_texts, train_target_texts, train_greedy_tokens):
                     if isinstance(y, list) and (not self.aggregated):
                         y_ = y[0]
                     elif isinstance(y, str) and (self.aggregated):
                         y_ = [y]
                     else:
                         y_ = y
-                    metrics.append(metric({"greedy_texts": [x], "target_texts": [y_]}, [y_])[0])
+                    metrics.append(self.metric({"greedy_texts": [x], "target_texts": [y_]}, [y_])[0])
                 self.train_seq_metrics = np.array(metrics)
                 stats[metric_key] = self.train_seq_metrics
 
             train_mds = []
-            dev_size = 0.5 
+            dev_size = 0.5
             train_idx, dev_idx = train_test_split(list(range(len(train_greedy_texts))), test_size=dev_size, shuffle=True, random_state=42)
             lens = np.array([0]+[len(tokens) for tokens in train_greedy_tokens])
             tokens_before = np.cumsum(lens)
@@ -152,11 +147,10 @@ class LinRegTokenMahalanobisDistance_Hybrid(Estimator):
                                    f"tokens": [train_greedy_tokens[k] for k in dev_idx],
                                    f"greedy_tokens": [train_greedy_tokens[k] for k in dev_idx],
                                    "train_target_texts": [train_target_texts[k] for k in train_idx],
-                                   "train_source_ids": [train_source_ids[k] for k in train_idx],
                                    f"train_token_embeddings_{self.embeddings_type}": [train_token_embeddings[k] for k in token_train_idx],
                                    f"token_embeddings_{self.embeddings_type}": [train_token_embeddings[k] for k in token_dev_idx],
                                   }
-                    if "relative" in self.ue.lower(): 
+                    if "relative" in self.ue.lower():
                         train_stats[f"background_train_token_embeddings_{self.embeddings_type}"] = stats[f"background_train_token_embeddings_{self.embeddings_type}"]
                 else:
                     train_token_embeddings = stats[f"train_token_embeddings_{self.embeddings_type}_{layer}"]
@@ -166,13 +160,12 @@ class LinRegTokenMahalanobisDistance_Hybrid(Estimator):
                                    f"tokens": [train_greedy_tokens[k] for k in dev_idx],
                                    f"greedy_tokens": [train_greedy_tokens[k] for k in dev_idx],
                                    "train_target_texts": [train_target_texts[k] for k in train_idx],
-                                   "train_source_ids": [train_source_ids[k] for k in train_idx],
                                    f"train_token_embeddings_{self.embeddings_type}_{layer}": [train_token_embeddings[k] for k in token_train_idx],
                                    f"token_embeddings_{self.embeddings_type}_{layer}": [train_token_embeddings[k] for k in token_dev_idx],
                                   }
-                    if "relative" in self.ue.lower(): 
+                    if "relative" in self.ue.lower():
                         train_stats[f"background_train_token_embeddings_{self.embeddings_type}_{layer}"] = stats[f"background_train_token_embeddings_{self.embeddings_type}_{layer}"]
-                    
+
                 metric_key = f"train_{self.metric_md_name}_{len(train_greedy_texts)}"
                 if metric_key in stats.keys():
                     train_stats[f"train_{self.metric_md_name}_{len(train_idx)}"] = stats[metric_key][token_train_idx]
@@ -181,7 +174,7 @@ class LinRegTokenMahalanobisDistance_Hybrid(Estimator):
                     hidden_layer = ""
                 else:
                     hidden_layer = f"_{layer}"
-                    
+
                 centroid_key_ = f"centroid{hidden_layer}_{self.metric_name}_{self.metric_thr}_{len(train_idx)}"
                 covariance_key_ = f"covariance{hidden_layer}_{self.metric_name}_{self.metric_thr}_{len(train_idx)}"
 
@@ -196,7 +189,7 @@ class LinRegTokenMahalanobisDistance_Hybrid(Estimator):
                     train_stats[background_centroid_key_] = stats[background_centroid_key_]
                 if background_covariance_key_ in stats.keys():
                     train_stats[background_covariance_key_] = stats[background_covariance_key_]
-                
+
                 md = self.tmds[layer](train_stats, save_data=False).reshape(-1)
 
                 if "Relative" in self.ue:

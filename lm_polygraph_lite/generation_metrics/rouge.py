@@ -52,12 +52,9 @@ class RougeMetric(GenerationMetric):
         Returns:
             np.ndarray: list of Rouge Scores for each sample in input.
         """
-        results = []
-        for hyp, ref in zip(stats["greedy_texts"], target_texts):
-            if isinstance(ref, list):
-                results.append(
-                    max(self._score_single(hyp, r) for r in ref) if ref else np.nan
-                )
-            else:
-                results.append(self._score_single(hyp, ref))
-        return np.array(results)
+        return np.array(
+            [
+                self._score_single(hyp, ref)
+                for hyp, ref in zip(stats["greedy_texts"], target_texts)
+            ]
+        )

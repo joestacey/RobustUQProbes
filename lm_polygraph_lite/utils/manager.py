@@ -140,8 +140,8 @@ class UEManager:
         """
         Parameters:
             data: Dataset to run benchmark on. Any object whose iteration yields
-                (input_texts, target_texts) batches and supports
-                len(), e.g. probe_drift.dataset.Dataset or utils.dataset.RawTextDataset.
+                (input_texts, target_texts, max_new_tokens) batches and supports
+                len() - e.g. utils.dataset.RawTextDataset.
             model (Model): Model to run benchmark on.
             estimator (Estimator): Estimator to evaluate at benchmark.
             generation_metrics (List[GenerationMetrics]): List of methods to use to calculate ground-truth uncertainty.
@@ -290,7 +290,7 @@ class UEManager:
 
         iterable_data = tqdm(self.data) if self.verbose else self.data
 
-        for batch_i, (inp_texts, target_texts) in enumerate(
+        for batch_i, (inp_texts, target_texts, max_new_tokens) in enumerate(
             iterable_data
         ):
             batch_stats: Dict[str, np.ndarray] = {}
@@ -313,7 +313,7 @@ class UEManager:
             
             batch_stats["tokenizer"] = self.model.tokenizer
 
-            batch_stats = self.calculate(batch_stats, self.stat_calculators, inp_texts, self.max_new_tokens)
+            batch_stats = self.calculate(batch_stats, self.stat_calculators, inp_texts, max(max_new_tokens))
 
             batch_estimations = self.estimate(batch_stats, batch_i)
 
@@ -525,11 +525,10 @@ class UEManager:
 
         
         consider_token_outputs_independently = {'input_texts': True, 'target_texts': True}
-        source_ids_offset = 0
 
         if len(stat_calculators) and (data is not None):
 
-            for inp_texts, target_texts in tqdm(data):
+            for inp_texts, target_texts, max_new_tokens in tqdm(data):
                 batch_stats: Dict[str, np.ndarray] = {}
                 for key, val in [
                     ("input_texts", inp_texts),
@@ -537,26 +536,16 @@ class UEManager:
                 ]:
                     batch_stats[key] = val
 
-                # source_ids (per-example source dataset id) is only meaningful for the
-                # foreground training data; background_train_data (the C4 corpus used for
-                # SATRMD-family MD statistics) isn't one of the classified datasets.
-                if (not background) and (data.source_ids is not None):
-                    batch_stats["source_ids"] = data.source_ids[
-                        source_ids_offset : source_ids_offset + len(inp_texts)
-                    ]
-                    consider_token_outputs_independently["source_ids"] = True
-                source_ids_offset += len(inp_texts)
-
                 for stat_calculator in stat_calculators:
                     # CompiledFeatures needs feature extractors passed explicitly.
                     if isinstance(stat_calculator, CompiledFeatures):
                         feature_extractors, head_cfg = self._get_extracted_features()
 
                         new_stats = stat_calculator(
-                        batch_stats, inp_texts, self.model, max_new_tokens, feature_extractors=feature_extractors, head_cfg=head_cfg)
+                        batch_stats, inp_texts, self.model, max(max_new_tokens), feature_extractors=feature_extractors, head_cfg=head_cfg)
                     else:
                         new_stats = stat_calculator(
-                            batch_stats, inp_texts, self.model, max_new_tokens)
+                            batch_stats, inp_texts, self.model, max(max_new_tokens))
 
                     for stat, stat_value in new_stats.items():
                         if stat in batch_stats.keys():

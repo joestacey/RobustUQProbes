@@ -2,9 +2,9 @@
 
 Code for the paper [**Hidden Failures in Robustness: Why Supervised Uncertainty Quantification Needs Better Evaluation**](https://arxiv.org/pdf/2604.11662).
 
-The [**ProbeDrift**](https://github.com/joestacey/ProbeDrift) evaluation framework introduced in this paper lives in an external repo containing all of the dataset loading and evaluation splits.
-
 This implementation adapts code from [**token_mahalanobis_distance**](https://github.com/ArtemVazh/token_mahalanobis_distance/tree/main) and [**llm-uncertainty-head**](https://github.com/IINemo/llm-uncertainty-head).
+
+This branch replicates the code used to run the paper experiments, with any differences to the main branch (updated code) explained in [differences_to_main.txt](differences_to_main.txt).
 
 ---
 
@@ -12,7 +12,6 @@ This implementation adapts code from [**token_mahalanobis_distance**](https://gi
 
 ```bash
 pip install -r requirements.txt
-pip install git+https://github.com/joestacey/ProbeDrift.git
 ```
 
 The main model (`meta-llama/Meta-Llama-3.1-8B`) is gated. Set your token before running:
@@ -50,30 +49,38 @@ If you want to run the steps manually (e.g. to reuse an existing MSP run), the r
 
 **Step 1 : MSP** (training-free; one run per dataset, reused across all OOD settings):
 ```bash
-python run_polygraph.py --method msp --eval_dataset sciq \
-    --model_path meta-llama/Meta-Llama-3.1-8B --attn_implementation eager \
-    --max_new_tokens 20 --output_file hbo_outputs/msp_sciq.jsonl
+HYDRA_CONFIG=configs/polygraph_eval_sciq.yaml python run_polygraph.py \
+    use_seq_ue=True use_density_based_ue=False batch_size=1 \
+    subsample_eval_dataset=2000 \
+    model.path=meta-llama/Meta-Llama-3.1-8B +model.attn_implementation=eager \
+    +method=msp +loadin4bit=False \
+    +output_file=hbo_outputs/msp_sciq.jsonl
 ```
 
 **Step 2 : SAPLMA-middle** (one run per dataset + OOD setting):
 ```bash
-python run_polygraph.py --method feature_supervision \
-    --probe_head_type full_sequence_saplma \
-    --probe_feature_extractor_setting hs_middle \
-    --token_aggregation average \
-    --eval_dataset sciq --ood_setting ID \
-    --model_path meta-llama/Meta-Llama-3.1-8B --attn_implementation eager \
-    --clean_md_device cuda --max_new_tokens 20 \
-    --output_file hbo_outputs/saplma_sciq_ID.jsonl
+HYDRA_CONFIG=configs/polygraph_eval_sciq.yaml python run_polygraph.py \
+    use_density_based_ue=True batch_size=1 \
+    subsample_train_dataset=1800 subsample_eval_dataset=2000 \
+    model.path=meta-llama/Meta-Llama-3.1-8B +model.attn_implementation=eager \
+    +metric_thrs='[0.3]' +layers='[-1]' \
+    +method=feature_supervision +probe.head_type=full_sequence_saplma \
+    +probe.feature_extractor_setting=hs_middle +token_aggregation=average \
+    +pre_compile_features=True +loadin4bit=False \
+    +output_file=hbo_outputs/saplma_sciq_ID.jsonl
 ```
 
 **Step 3 : SATMD** (one run per dataset + OOD setting; produces `.jsonl` + `_train.npy`):
 ```bash
-python run_polygraph.py --method satmd \
-    --eval_dataset sciq --ood_setting ID \
-    --model_path meta-llama/Meta-Llama-3.1-8B --attn_implementation eager \
-    --metric_thr 0.3 --clean_md_device cuda --max_new_tokens 20 \
-    --md_save_file hbo_outputs/satmd_sciq_ID
+HYDRA_CONFIG=configs/polygraph_eval_sciq.yaml python run_polygraph.py \
+    use_density_based_ue=True batch_size=1 \
+    subsample_train_dataset=1800 subsample_eval_dataset=2000 \
+    subsample_background_train_dataset=1 \
+    model.path=meta-llama/Meta-Llama-3.1-8B +model.attn_implementation=eager \
+    +metric_thrs='[0.3]' +layers='[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,-1]' \
+    +clean_md_device=cuda \
+    +method=satmd +token_aggregation=average +pre_compile_features=True +loadin4bit=False \
+    +md_save_file=hbo_outputs/satmd_sciq_ID
 ```
 
 **Step 4 : combine:**
@@ -94,10 +101,8 @@ LLM-as-judge scores replace the automatic metric (ROUGE/accuracy) in `run_polygr
 
 **Step 1 : collect model outputs:**
 ```bash
-python collect_llm_judge_inputs.py \
-    --eval_dataset sciq --ood_setting ID --split eval \
-    --model_path meta-llama/Meta-Llama-3.1-8B \
-    --output_file judge_inputs/eval_sciq.json
+HYDRA_CONFIG=configs/polygraph_eval_sciq.yaml python collect_llm_judge_inputs.py \
+    +split=eval +output_file=judge_inputs/eval_sciq.json
 ```
 
 **Step 2 : score with the LLM judge** (requires `OPENAI_API_KEY`):
@@ -110,12 +115,12 @@ python run_llm_judge.py \
 
 **Step 3 : run the probe experiment using the judge scores:**
 ```bash
-python run_polygraph.py --method feature_supervision ... \
-    --eval_dataset sciq --ood_setting ID \
-    --llm_judge_file judge_scores/eval_sciq.json
+HYDRA_CONFIG=configs/polygraph_eval_sciq.yaml python run_polygraph.py \
+    +method=feature_supervision ... \
+    +llm_judge_file=judge_scores/eval_sciq.json
 ```
 
-`--eval_dataset`, `--ood_setting`, `--instruct`, and `--model_path` must match between `collect_llm_judge_inputs.py` and `run_polygraph.py` so the examples align.
+`collect_llm_judge_inputs.py` must be run with the same `HYDRA_CONFIG` and overrides as the corresponding `run_polygraph.py` run, so the examples align.
 
 ---
 

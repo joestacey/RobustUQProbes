@@ -26,7 +26,6 @@ class RelativeTokenMahalanobisDistance(Estimator):
         metric_thr: float = 0.0,
         aggregation: str = "mean",
         metric = None,
-        metric_router = None,
         aggregated: bool = False,
         metric_name: str = "",
         hidden_layer: int = -1,
@@ -47,7 +46,7 @@ class RelativeTokenMahalanobisDistance(Estimator):
         self.max = -1e100
         self.metric_name = metric_name
         self.MD = TokenMahalanobisDistance(
-            embeddings_type, normalize=False, metric_thr=metric_thr, metric=metric, metric_name=metric_name, metric_router=metric_router, aggregation="none", hidden_layer=self.hidden_layer, aggregated=aggregated, device=device, storage_device=storage_device,
+            embeddings_type, normalize=False, metric_thr=metric_thr, metric=metric, metric_name=metric_name, aggregation="none", hidden_layer=self.hidden_layer, aggregated=aggregated, device=device, storage_device=storage_device,
         )
         self.is_fitted = False
         self.metric_thr = metric_thr

@@ -39,7 +39,6 @@ class FeatureSupervision(Estimator):
                  storage_device: str = "cuda",
                  metric=None,
                  metric_name: str = "",
-                 metric_router=None,
                  aggregated: bool = False,
                  config=None,
                  head=None,
@@ -48,7 +47,7 @@ class FeatureSupervision(Estimator):
                  ):
 
         assert config is not None
-        assert (metric is not None) or (metric_router is not None)
+        assert metric is not None
 
         for key in ['head_type', 'feature_extractor', 'uncertainty_head']:
             assert key in config.keys()
@@ -61,8 +60,7 @@ class FeatureSupervision(Estimator):
         self.is_fitted = False
         self.pre_compile_features = pre_compile_features
 
-        self.metric = (AggregatedMetric(base_metric=metric) if aggregated else metric) if metric is not None else None
-        self.metric_router = metric_router
+        self.metric = AggregatedMetric(base_metric=metric) if aggregated else metric
         self.aggregated = aggregated
         self.metric_name = metric_name
 
@@ -158,18 +156,15 @@ class FeatureSupervision(Estimator):
             train_target_texts = stats['train_target_texts']
             train_greedy_tokens = stats['train_greedy_tokens']
             train_input_texts = stats['train_input_texts']
-            train_source_ids = stats["train_source_ids"] if self.metric_router is not None else [None] * len(train_greedy_texts)
 
-            for x, y, i_t, src in zip(train_greedy_texts, train_target_texts, train_input_texts, train_source_ids):
-                metric = self.metric_router(src) if self.metric_router is not None else self.metric
-
+            for x, y, i_t in zip(train_greedy_texts, train_target_texts, train_input_texts):
                 if isinstance(y, list) and (not self.aggregated):
                     y_ = y[0]
                 elif isinstance(y, str) and (self.aggregated):
                     y_ = [y]
                 else:
                     y_ = y
-                metrics.append(metric({"greedy_texts": [x], "target_texts": [y_], "input_texts": [i_t]}, [y_])[0])
+                metrics.append(self.metric({"greedy_texts": [x], "target_texts": [y_], "input_texts": [i_t]}, [y_])[0])
 
             targets = 1 - np.array(metrics)  # invert quality scores: high metric = good output = low uncertainty
 

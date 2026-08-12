@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
-# Table 1: MSP, Llama-3.1-8B
+# Table 1 — MSP, Llama-3.1-8B
 #
-# MSP is training-free, so one run per dataset covers all OOD settings.
+# MSP has no training step (no estimator fit), so there is no LOO /
+# 1D-SameTask / DiffTask / 1D-DiffTask variation to run — just one eval
+# per Table 1 eval dataset.
 #
 # Set HF_HUB_TOKEN in your environment before running if models are gated.
 
 set -e
 PYTHON="${PYTHON:-python}"
 
-EVAL_DATASETS=(sciq trivia_qa qa pubmed_qa xsum cnn_dailymail)
-declare -A MAX_NEW_TOKENS=([sciq]=20 [trivia_qa]=20 [qa]=20 [xsum]=56 [pubmed_qa]=128 [cnn_dailymail]=128)
-
 COMMON=(
-  --method msp
-  --batch_size 1
-  --model_path meta-llama/Meta-Llama-3.1-8B
-  --attn_implementation eager
+  use_seq_ue=True
+  use_density_based_ue=False
+  batch_size=1
+  subsample_eval_dataset=2000
+  model.path=meta-llama/Meta-Llama-3.1-8B
+  +model.attn_implementation=eager
+  +method=msp
+  +loadin4bit=False
 )
 
-for ds in "${EVAL_DATASETS[@]}"; do
-  $PYTHON run_polygraph.py "${COMMON[@]}" --eval_dataset "$ds" --max_new_tokens "${MAX_NEW_TOKENS[$ds]}"
-done
+HYDRA_CONFIG=configs/polygraph_eval_sciq.yaml      $PYTHON run_polygraph.py "${COMMON[@]}"
+HYDRA_CONFIG=configs/polygraph_eval_triviaqa.yaml  $PYTHON run_polygraph.py "${COMMON[@]}"
+HYDRA_CONFIG=configs/polygraph_eval_coqa.yaml      $PYTHON run_polygraph.py "${COMMON[@]}"
+HYDRA_CONFIG=configs/polygraph_eval_pubmedqa.yaml  $PYTHON run_polygraph.py "${COMMON[@]}"
+HYDRA_CONFIG=configs/polygraph_eval_xsum.yaml      $PYTHON run_polygraph.py "${COMMON[@]}"
+HYDRA_CONFIG=configs/polygraph_eval_cnn.yaml       $PYTHON run_polygraph.py "${COMMON[@]}"
