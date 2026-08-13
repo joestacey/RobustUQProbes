@@ -119,6 +119,12 @@ python run_polygraph.py --method feature_supervision ... \
 
 ---
 
+## Reproducibility
+
+While the main branch contains the latest project code, the `exact_paper_setup` branch reproduces the exact pipeline used to generate the paper's published results.
+
+---
+
 ## Contact
 
 Questions about the paper or this repo: j.stacey@sheffield.ac.uk
